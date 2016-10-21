@@ -124,7 +124,7 @@ int main(int argc, char **argv)
 {
 	int retval;
 	struct sigaction sig;
-	struct udev_monitor *monitor;
+	struct udev_monitor *monitor = NULL;
 	struct udev *udev = udev_new();
 
 	if (!udev) {
