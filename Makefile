@@ -1,10 +1,13 @@
 OUTPUT = main
 INCLUDES = -I../systemd/src/libudev
 CFLAGS = -Wall -g -O0 $(INCLUDES)
-LIBS = /home/strunk/code/systemd/.libs
+LIBS = $(SYSTEMD_SRC)/.libs
 
 .PHONY: clean
 all: main.c
+ifndef SYSTEMD_SRC
+	$(error "Variable SYSTEMD_SRC not defined. Aborting.")
+endif
 	gcc $(CFLAGS) -o $(OUTPUT) $^ -L$(LIBS) -ludev -Wl,-rpath=$(LIBS)
 
 clean:
