@@ -5,8 +5,6 @@
  *      Author: Ander Juaristi
  *
  *  Unsupported operations:
- *  	- readlink
- *  	- symlink
  *  	- link
  *  	- statfs
  *  	- flush
@@ -31,17 +29,53 @@
  *  	- create
  */
 #define FUSE_USE_VERSION 30
-#include <linux/limits.h>
-#include <unistd.h>	/* rmdir(2), stat(2), unlink(2), chown(2) */
-#include <sys/stat.h>	/* mkdir(2), chmod(2) */
 #include <stdio.h>	/* rename(2) */
+#include <string.h>
+#include <linux/limits.h>
+#include <unistd.h>	/* rmdir(2), stat(2), unlink(2), chown(2),... */
+#include <sys/stat.h>	/* mkdir(2), chmod(2) */
 #include <dirent.h>
 #include <stddef.h>	/* offsetof() macro */
 #include <errno.h>
 #include <fuse.h>
 #include <fuse_lowlevel.h>
 
-int dm_fullpath(const char *in, char *out, size_t outlen);
+static char root_path[PATH_MAX];
+static unsigned int root_path_len;
+
+int dm_fullpath(const char *in, char *out, size_t outlen)
+{
+#define FIRST_CHAR(v) (v[0])
+#define LAST_CHAR(v) (v[v##_len - 1])
+	char must_add_slash = 0, slash = '/';
+
+	if (!in || !out || outlen == 0)
+		return 0;
+
+	size_t in_len = strlen(in);
+	size_t ttl_len = root_path_len + in_len + 1;
+
+	if (LAST_CHAR(root_path) != '/' && FIRST_CHAR(in) != '/') {
+		ttl_len++;
+		must_add_slash = 1;
+	} else if (LAST_CHAR(root_path) == '/' && FIRST_CHAR(in) == '/') {
+		in++;
+		ttl_len--;
+	}
+
+	if (outlen < ttl_len)
+		return 0;
+
+	strcpy(out, root_path);
+	if (must_add_slash)
+		strncat(out, &slash, 1);
+	strcat(out, in);
+
+	fprintf(stderr, "DEBUG: fullpath = %s\n", out);
+	return 1;
+#undef FIRST_CHAR
+#undef LAST_CHAR
+}
 
 static void *dm_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
@@ -54,6 +88,7 @@ static void *dm_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
  */
 static int dm_fuse_getattr(const char *path, struct stat *st, struct fuse_file_info *fi)
 {
+	int retval = 0;
 	char fullpath[PATH_MAX];
 
 	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
@@ -61,7 +96,8 @@ static int dm_fuse_getattr(const char *path, struct stat *st, struct fuse_file_i
 	if (!st)
 		return -EFAULT;
 
-	return lstat(fullpath, st);
+	retval = lstat(fullpath, st);
+	return (retval == 0 ? retval : -errno);
 }
 
 /*
@@ -79,11 +115,52 @@ static int dm_fuse_mknod(const char *path, mode_t mode, dev_t dev)
 	if (!S_ISREG(mode))
 		return -EACCES;
 
+	struct fuse_context *ctx = fuse_get_context();
+
 	retval = open(fullpath, O_CREAT | O_EXCL | O_WRONLY, mode);
-	if (retval >= 0)
+	if (retval >= 0) {
 		close(retval);
+		retval = 0;
+	} else if (retval == -1) {
+		retval = -errno;
+	}
 
 	return retval;
+}
+
+/*
+ * Create a symbolic link.
+ * Argument 'path' is where the link points, while 'link'
+ * is the link itself.
+ */
+static int dm_fuse_symlink(const char *path, const char *link)
+{
+	char full_link[PATH_MAX];
+
+	if (!path || !link || !dm_fullpath(link, full_link, sizeof(full_link)))
+		return -EFAULT;
+	return (symlink(path, full_link) == 0 ? 0 : -errno);
+}
+
+static int dm_fuse_readlink(const char *path, char *buf, size_t buflen)
+{
+	size_t retval = 0;
+	char fullpath[PATH_MAX];
+
+	if (!path || !buf || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+		return -EFAULT;
+
+	retval = readlink(fullpath, buf, buflen - 1);
+	if (retval >= 0) {
+		buf[retval] = '\0';
+		retval = 0;
+	} else {
+		memset(buf, 0, buflen);
+		retval = -errno;
+	}
+
+	return retval;
+
 }
 
 /*
@@ -95,6 +172,8 @@ static int dm_fuse_mkdir(const char *path, mode_t mode)
 
 	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
+
+	struct fuse_context *ctx = fuse_get_context();
 
 	return mkdir(fullpath, mode);
 }
@@ -308,10 +387,12 @@ void print_help()
 
 int main(int argc, char **argv)
 {
-	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+	struct fuse_args args;
 	struct fuse_operations dm_operations = {
 		.init           = dm_fuse_init,
 		.getattr	= dm_fuse_getattr,
+		.symlink	= dm_fuse_symlink,
+		.readlink	= dm_fuse_readlink,
 		.mknod		= dm_fuse_mknod,
 		.mkdir		= dm_fuse_mkdir,
 		.unlink		= dm_fuse_unlink,
@@ -336,13 +417,33 @@ int main(int argc, char **argv)
 		FUSE_OPT_END
 	};
 
+	if (argc < 3)
+		goto help;
+
+	/*
+	 * The last argument should be the root directory.
+	 * Strip it off.
+	 */
+	argc--;
+	root_path_len = strlen(argv[argc]);
+	if (root_path_len > sizeof(root_path) - 1) {
+		fprintf(stderr, "ERROR: too large root path.\n");
+		return 1;
+	}
+	strcpy(root_path, argv[argc]);
+
+	args.argc = argc;
+	args.argv = argv;
+	args.allocated = 0;
 	if (fuse_opt_parse(&args, &options, opts, NULL) == -1)
 		return 1;
 
-	if (options.show_help) {
-		print_help();
-		return 0;
-	}
+	if (options.show_help)
+		goto help;
 
 	return fuse_main(args.argc, args.argv, &dm_operations, NULL);
+
+help:
+	print_help();
+	return 0;
 }
