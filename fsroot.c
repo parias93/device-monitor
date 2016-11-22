@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include "hash.h"
+#include "mm.h"
 
 /*
  * TODO
@@ -38,15 +39,11 @@ struct fsroot_file {
 	gid_t gid;
 	/* TODO this should not be public */
 	/* TODO maybe this should be an 'fsroot_directory' */
-	struct fsroot_file *parent;
+	struct fsroot_file *parent_dir;
 };
 
 /* TODO maybe we could directly define the fields here? */
 #define FSROOT_FILE struct fsroot_file __file
-//#define name (__file.name)
-//#define mode (__file.mode)
-//#define uid  (__file.uid)
-//#define gid  (__file.gid)
 
 struct fsroot_symlink {
 	FSROOT_FILE;
@@ -57,22 +54,22 @@ struct fsroot_directory {
 	FSROOT_FILE;
 	struct fsroot_file **entries;
 	size_t num_entries;
+	size_t num_slots;
 };
+
+//#define name (__file.name)
+//#define mode (__file.mode)
+//#define uid  (__file.uid)
+//#define gid  (__file.gid)
 
 /* TODO what does 'static' do here? */
 static struct hash_table *files;
-
-/* TODO get this out of here */
-/* TODO we should check return value of calloc() != NULL */
-#define xnew0(type) calloc(1, sizeof(type))
-#define xnew0n(n, type) calloc(n, sizeof(type))
-#define xfree(ptr)  do { if (ptr) free(ptr); ptr = (void *) 0; } while (0)
 
 static char **fsroot_path_split(const char *ppath, size_t *outlen)
 {
 	const char *path = ppath + strlen(ppath) - 1;
 	size_t parts_len = 10, count = 0, idx = 0;
-	char **parts = xnew0n(parts_len, char *);
+	char **parts = mm_new(parts_len, char *);
 
 	while (path >= ppath) {
 		while (*path == '/') {
@@ -94,7 +91,7 @@ static char **fsroot_path_split(const char *ppath, size_t *outlen)
 		parts[idx++] = strndup(path, count);
 		if (idx == parts_len) {
 			parts_len <<= 1;
-			parts = realloc(parts, sizeof(char *) * parts_len);
+			parts = mm_reallocn(parts, parts_len, sizeof(char *));
 		}
 
 		count = 0;
@@ -113,7 +110,7 @@ fail:
 static size_t *fsroot_compute_path_indexes(const char **path, size_t len, size_t *outlen)
 {
 	size_t idx = 0, count = 0;
-	size_t *indexes = xnew0n(len, size_t);
+	size_t *indexes = mm_new(len, size_t);
 
 	while (idx < len) {
 		if (strcmp(path[idx], "..") == 0) {
@@ -129,7 +126,7 @@ static size_t *fsroot_compute_path_indexes(const char **path, size_t len, size_t
 
 		if (count == len) {
 			len <<= 1;
-			indexes = realloc(indexes, sizeof(unsigned int) * len);
+			indexes = mm_reallocn(indexes, len, sizeof(size_t));
 		}
 
 		indexes[count++] = idx++;
@@ -156,7 +153,7 @@ static char *fsroot_full_path(const char **path, size_t *indexes, size_t indexes
 		fullpath_len += strlen(path[cur_index]) + 1; /* +1 for the trailing slash ('/') */
 	}
 
-	fullpath = xnew0n(fullpath_len, char);
+	fullpath = mm_new(fullpath_len, char);
 
 	for (size_t i = 0; i < indexes_len; i++) {
 		size_t cur_index = indexes[i];
@@ -192,17 +189,14 @@ void fsroot_getattr()
 static int __fsroot_create_file(struct fsroot_directory *dir, struct fsroot_file *file)
 {
 	if (dir) {
-		/*
-		 * TODO
-		 * This should check we have enough space
-		 * and resize the array if needed!
-		 */
-		dir->entries[dir->num_entries] = file;
-		dir->num_entries++;
-
-		file->parent = (struct fsroot_file *) dir;
+		if (dir->num_entries == dir->num_slots) {
+			dir->num_slots <<= 1;
+			dir->entries = mm_reallocn(dir->entries, dir->num_slots, sizeof(struct fsroot_file *));
+		}
+		dir->entries[dir->num_entries++] = file;
+		file->parent_dir = (struct fsroot_file *) dir;
 	} else {
-		file->parent = NULL;
+		file->parent_dir = NULL;
 	}
 
 	return 0;
@@ -210,7 +204,7 @@ static int __fsroot_create_file(struct fsroot_directory *dir, struct fsroot_file
 
 static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, const char *name, uid_t uid, gid_t gid, mode_t mode)
 {
-	struct fsroot_file *file = xnew0(struct fsroot_file);
+	struct fsroot_file *file = mm_new0(struct fsroot_file);
 
 	file->name = strdup(name);
 	file->uid = uid;
@@ -218,7 +212,7 @@ static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, cons
 	file->mode = 0100000 | mode;
 
 	if (dir) {
-		file->parent = (struct fsroot_file *) dir;
+		file->parent_dir = (struct fsroot_file *) dir;
 		__fsroot_create_file(dir, file);
 	}
 
@@ -227,19 +221,19 @@ static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, cons
 
 static struct fsroot_directory *fsroot_create_directory(struct fsroot_directory *parent_dir, const char *name, uid_t uid, gid_t gid, mode_t mode)
 {
-	struct fsroot_directory *dir = xnew0(struct fsroot_directory);
+	struct fsroot_directory *dir = mm_new0(struct fsroot_directory);
 
 	dir->__file.name = strdup(name);
 	dir->__file.uid = uid;
 	dir->__file.gid = gid;
 	dir->__file.mode = 0040000 | mode;
 
-	/* TODO should use array management functions here */
-	dir->entries = xnew0n(10, struct fsroot_file *);
+	dir->entries = mm_new(10, struct fsroot_file *);
+	dir->num_slots = 10;
 	dir->num_entries = 0;
 
 	if (parent_dir) {
-		dir->__file.parent = (struct fsroot_file *) parent_dir;
+		dir->__file.parent_dir = (struct fsroot_file *) parent_dir;
 		__fsroot_create_file(parent_dir, (struct fsroot_file *) dir);
 	}
 
@@ -249,7 +243,7 @@ static struct fsroot_directory *fsroot_create_directory(struct fsroot_directory 
 static int fsroot_remove_file(struct fsroot_file *file)
 {
 	int i, j;
-	struct fsroot_directory *dir = (struct fsroot_directory *) file->parent;
+	struct fsroot_directory *dir = (struct fsroot_directory *) file->parent_dir;
 
 	if (dir) {
 		/* Get to the file we're looking for */
@@ -263,12 +257,9 @@ static int fsroot_remove_file(struct fsroot_file *file)
 				if (j + 1 < dir->num_entries)
 					dir->entries[j] = dir->entries[j + 1];
 			}
-		} else {
-			/*
-			 * File not found. This should not happen.
-			 * TODO what to do here?
-			 */
 		}
+
+		/* Else file was not found. This should not happen. */
 	}
 }
 
@@ -292,7 +283,7 @@ int fsroot_symlink(const char *plink, const char *ppath, uid_t uid, gid_t gid)
 
 	/* The symlink points to the *relative* path */
 	//file = NEW_SYMLINK(full_link, path);
-	file = xnew0(struct fsroot_symlink);
+	file = mm_new0(struct fsroot_symlink);
 	file->__file.name = link;
 	/* TODO should check that the user and group exist */
 	file->__file.uid = uid;
@@ -301,7 +292,7 @@ int fsroot_symlink(const char *plink, const char *ppath, uid_t uid, gid_t gid)
 	file->target->name = path;
 
 	hash_table_put(files, link, file);
-	xfree(file);
+	mm_free(file);
 
 	return FSROOT_OK;
 }
@@ -340,14 +331,14 @@ int fsroot_mkdir(const char *ppath, uid_t uid, gid_t gid)
 		return FSROOT_E_EXISTS;
 
 	//file = NEW_DIRECTORY(fullpath);
-	file = xnew0(struct fsroot_directory);
+	file = mm_new0(struct fsroot_directory);
 	file->__file.name = path;
 	/* TODO should check that the user and group exist */
 	file->__file.uid = uid;
 	file->__file.gid = gid;
 	file->__file.mode = 0040000 | fsroot_umask();
 	hash_table_put(files, path, file);
-	xfree(file);
+	mm_free(file);
 
 	return FSROOT_OK;
 }
@@ -371,7 +362,7 @@ int fsroot_rmdir(const char *path)
 		return FSROOT_E_NONEMPTY;
 
 	hash_table_remove(files, path);
-	xfree(file);
+	mm_free(file);
 	return FSROOT_OK;
 }
 
@@ -423,8 +414,8 @@ int fsroot_rename(const char *path, const char *pnewpath)
 		/* The target directory does not exist. This is an error. */
 		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
 	}
-	free(newpath_indexes);
-	free(newpath_parts);
+	mm_free(newpath_indexes);
+	mm_free(newpath_parts);
 
 	/*
 	 * Tell the parent directory that this file is no longer
@@ -520,10 +511,11 @@ int fsroot_readdir(off_t offset, struct fsroot_file *directory, struct fsroot_fi
 	if (offset >= dir->num_entries) {
 		retval = FSROOT_OK;
 	} else {
-		file->name = dir->entries[offset]->name;
-		file->mode = dir->entries[offset]->mode;
-		file->uid = dir->entries[offset]->uid;
-		file->gid = dir->entries[offset]->gid;
+		struct fsroot_file *f = dir->entries[offset];
+		file->name = f->name;
+		file->mode = f->mode;
+		file->uid = f->uid;
+		file->gid = f->gid;
 		retval = FSROOT_MORE;
 	}
 
