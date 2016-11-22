@@ -19,6 +19,7 @@
  * TODO
  *  - Implement fsroot_getattr()
  *  - Get the umask for the user calling us
+ *  - Check that user & group exist
  *  - What happens when we have "../../..", etc?
  *  - Array & memory management utilities
  */
@@ -32,22 +33,16 @@
 #define FSROOT_E_NONEMPTY			-5
 #define FSROOT_E_NEW_DIRECTORY_NOTEXISTS	-6
 
-struct fsroot_file {
-	const char *name;
-	mode_t mode;
-	uid_t uid;
-	gid_t gid;
-	/* TODO this should not be public */
-	/* TODO maybe this should be an 'fsroot_directory' */
-	struct fsroot_file *parent_dir;
-};
-
-/* TODO maybe we could directly define the fields here? */
-#define FSROOT_FILE struct fsroot_file __file
+#define FSROOT_FILE		\
+	const char *name;	\
+	mode_t mode;		\
+	uid_t uid;		\
+	gid_t gid;		\
+	struct fsroot_directory *parent_dir
 
 struct fsroot_symlink {
 	FSROOT_FILE;
-	struct fsroot_file *target;
+	const char *target;
 };
 
 struct fsroot_directory {
@@ -55,6 +50,10 @@ struct fsroot_directory {
 	struct fsroot_file **entries;
 	size_t num_entries;
 	size_t num_slots;
+};
+
+struct fsroot_file {
+	FSROOT_FILE;
 };
 
 //#define name (__file.name)
@@ -65,16 +64,26 @@ struct fsroot_directory {
 /* TODO what does 'static' do here? */
 static struct hash_table *files;
 
+static void fsroot_invert_array(const char **arr, size_t len)
+{
+	const char *tmp;
+	for (size_t i = 0; i < (len / 2); i++) {
+		tmp = arr[i];
+		arr[i] = arr[len - i - 1];
+		arr[len - i - 1] = tmp;
+	}
+}
+
 static char **fsroot_path_split(const char *ppath, size_t *outlen)
 {
 	const char *path = ppath + strlen(ppath) - 1;
 	size_t parts_len = 10, count = 0, idx = 0;
 	char **parts = mm_new(parts_len, char *);
 
-	while (path >= ppath) {
+	while (path > ppath) {
 		while (*path == '/') {
 			path--;
-			if (path == ppath)
+			if (path < ppath)
 				goto fail;
 		}
 		while (*path != '/') {
@@ -84,11 +93,11 @@ static char **fsroot_path_split(const char *ppath, size_t *outlen)
 			count++;
 			path--;
 
-			if (path == ppath)
+			if (path < ppath)
 				goto fail;
 		}
 
-		parts[idx++] = strndup(path, count);
+		parts[idx++] = strndup(path + 1, count);
 		if (idx == parts_len) {
 			parts_len <<= 1;
 			parts = mm_reallocn(parts, parts_len, sizeof(char *));
@@ -100,6 +109,7 @@ static char **fsroot_path_split(const char *ppath, size_t *outlen)
 	if (idx == 0)
 		goto fail;
 
+	fsroot_invert_array((const char **) parts, idx);
 	*outlen = idx;
 	return parts;
 fail:
@@ -146,7 +156,7 @@ static char *fsroot_full_path(const char **path, size_t *indexes, size_t indexes
 {
 	const char slash = '/';
 	char *fullpath = NULL;
-	size_t fullpath_len = 1; /* Count the NULL terminator */
+	size_t fullpath_len = 2; /* Count the NULL terminator, and the initial '/' */
 
 	for (size_t i = 0; i < indexes_len; i++) {
 		size_t cur_index = indexes[i];
@@ -154,14 +164,48 @@ static char *fsroot_full_path(const char **path, size_t *indexes, size_t indexes
 	}
 
 	fullpath = mm_new(fullpath_len, char);
+	fullpath[0] = slash;
 
 	for (size_t i = 0; i < indexes_len; i++) {
 		size_t cur_index = indexes[i];
 		strcat(fullpath, path[cur_index]);
-		strncat(fullpath, &slash, 1);
+		if (i + 1 < indexes_len)
+			strncat(fullpath, &slash, 1);
 	}
 
 	return fullpath;
+}
+
+static char *fsroot_get_directory(const char *path)
+{
+	char *fullpath;
+	char **parts;
+	size_t *indexes = NULL;
+	size_t parts_len, indexes_len;
+
+	parts = fsroot_path_split(path, &parts_len);
+	if (!parts || !parts_len)
+		goto error;
+	if (parts_len == 1) {
+		fullpath = "/";
+		goto end;
+	}
+
+	indexes = fsroot_compute_path_indexes((const char **) parts, parts_len - 1, &indexes_len);
+	if (!indexes || !indexes_len)
+		goto error;
+
+	fullpath = fsroot_full_path((const char **) parts, indexes, indexes_len);
+
+end:
+	for (size_t i = 0; i < parts_len; i++)
+		mm_free(parts[i]);
+	mm_free(indexes);
+	mm_free(parts);
+
+	return fullpath;
+error:
+	return NULL;
 }
 
 /*
@@ -186,7 +230,7 @@ void fsroot_getattr()
 	return;
 }
 
-static int __fsroot_create_file(struct fsroot_directory *dir, struct fsroot_file *file)
+static void __fsroot_create_file(struct fsroot_directory *dir, struct fsroot_file *file)
 {
 	if (dir) {
 		if (dir->num_entries == dir->num_slots) {
@@ -194,50 +238,46 @@ static int __fsroot_create_file(struct fsroot_directory *dir, struct fsroot_file
 			dir->entries = mm_reallocn(dir->entries, dir->num_slots, sizeof(struct fsroot_file *));
 		}
 		dir->entries[dir->num_entries++] = file;
-		file->parent_dir = (struct fsroot_file *) dir;
+		file->parent_dir = dir;
 	} else {
 		file->parent_dir = NULL;
 	}
-
-	return 0;
 }
 
-static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, const char *name, uid_t uid, gid_t gid, mode_t mode)
+static void __fsroot_create_directory(struct fsroot_directory *parent_dir, struct fsroot_directory *dir)
 {
-	struct fsroot_file *file = mm_new0(struct fsroot_file);
-
-	file->name = strdup(name);
-	file->uid = uid;
-	file->gid = gid;
-	file->mode = 0100000 | mode;
-
-	if (dir) {
-		file->parent_dir = (struct fsroot_file *) dir;
-		__fsroot_create_file(dir, file);
-	}
-
-	return file;
-}
-
-static struct fsroot_directory *fsroot_create_directory(struct fsroot_directory *parent_dir, const char *name, uid_t uid, gid_t gid, mode_t mode)
-{
-	struct fsroot_directory *dir = mm_new0(struct fsroot_directory);
-
-	dir->__file.name = strdup(name);
-	dir->__file.uid = uid;
-	dir->__file.gid = gid;
-	dir->__file.mode = 0040000 | mode;
-
 	dir->entries = mm_new(10, struct fsroot_file *);
 	dir->num_slots = 10;
 	dir->num_entries = 0;
 
-	if (parent_dir) {
-		dir->__file.parent_dir = (struct fsroot_file *) parent_dir;
-		__fsroot_create_file(parent_dir, (struct fsroot_file *) dir);
+	__fsroot_create_file(parent_dir, (struct fsroot_file *) dir);
+}
+
+static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, const char *name, uid_t uid, gid_t gid, mode_t mode)
+{
+	struct fsroot_file *file = NULL;
+
+	switch (mode & S_IFMT) {
+	case S_IFREG:
+		file = mm_new0(struct fsroot_file);
+		__fsroot_create_file(dir, file);
+		break;
+	case S_IFDIR:
+		file = mm_new0(struct fsroot_directory);
+		__fsroot_create_directory(dir, (struct fsroot_directory *) file);
+		break;
+	case S_IFLNK:
+		file = mm_new0(struct fsroot_symlink);
+		__fsroot_create_file(dir, file);
+		break;
 	}
 
-	return dir;
+	file->name = strdup(name);
+	file->uid = uid;
+	file->gid = gid;
+	file->mode = mode;
+
+	return file;
 }
 
 static int fsroot_remove_file(struct fsroot_file *file)
@@ -265,8 +305,9 @@ static int fsroot_remove_file(struct fsroot_file *file)
 
 int fsroot_symlink(const char *plink, const char *ppath, uid_t uid, gid_t gid)
 {
-	struct fsroot_symlink *file;
-	char *link, *path;
+	struct fsroot_directory *dir = NULL;
+	struct fsroot_symlink *file = NULL;
+	char *link, *path, *directory;
 
 	if (!plink || !ppath)
 		return FSROOT_E_BADARGS;
@@ -278,22 +319,21 @@ int fsroot_symlink(const char *plink, const char *ppath, uid_t uid, gid_t gid)
 
 	if (hash_table_contains(files, link))
 		return FSROOT_E_EXISTS;
-	if (!hash_table_contains(files, path))
-		return FSROOT_E_NOTEXISTS;
 
+	directory = fsroot_get_directory(link);
+	if (strcmp(directory, "/") == 0)
+		goto create_file;
+
+	dir = hash_table_get(files, directory);
+	if (!dir)
+		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
+
+create_file:
+	file = (struct fsroot_symlink *) fsroot_create_file(dir, link, uid, gid, S_IFLNK);
 	/* The symlink points to the *relative* path */
-	//file = NEW_SYMLINK(full_link, path);
-	file = mm_new0(struct fsroot_symlink);
-	file->__file.name = link;
-	/* TODO should check that the user and group exist */
-	file->__file.uid = uid;
-	file->__file.gid = gid;
-	file->__file.mode = 0120000 | fsroot_umask();
-	file->target->name = path;
+	file->target = path;
 
 	hash_table_put(files, link, file);
-	mm_free(file);
-
 	return FSROOT_OK;
 }
 
@@ -305,20 +345,20 @@ int fsroot_readlink(const char *path, char *dst, size_t dstlen)
 		return FSROOT_E_BADARGS;
 
 	file = hash_table_get(files, path);
-	if (file == NULL || !S_ISLNK(file->__file.mode))
+	if (file == NULL || !S_ISLNK(file->mode))
 		return FSROOT_E_NOTEXISTS;
 
-	if (strlen(file->target->name) + 1 > dstlen)
+	if (strlen(file->target) + 1 > dstlen)
 		return FSROOT_E_NOMEM;
-	strcpy(dst, file->target->name);
+	strcpy(dst, file->target);
 
 	return FSROOT_OK;
 }
 
 int fsroot_mkdir(const char *ppath, uid_t uid, gid_t gid)
 {
-	struct fsroot_directory *file;
-	char *path;
+	struct fsroot_directory *file, *dir;
+	char *path, *directory;
 
 	if (!ppath)
 		return FSROOT_E_BADARGS;
@@ -330,15 +370,12 @@ int fsroot_mkdir(const char *ppath, uid_t uid, gid_t gid)
 	if (hash_table_contains(files, path))
 		return FSROOT_E_EXISTS;
 
-	//file = NEW_DIRECTORY(fullpath);
-	file = mm_new0(struct fsroot_directory);
-	file->__file.name = path;
-	/* TODO should check that the user and group exist */
-	file->__file.uid = uid;
-	file->__file.gid = gid;
-	file->__file.mode = 0040000 | fsroot_umask();
+	directory = fsroot_get_directory(path);
+	dir = hash_table_get(files, directory);
+	if (!dir)
+		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
+	file = (struct fsroot_directory *) fsroot_create_file(dir, path, uid, gid, S_IFDIR);
 	hash_table_put(files, path, file);
-	mm_free(file);
 
 	return FSROOT_OK;
 }
@@ -346,13 +383,12 @@ int fsroot_mkdir(const char *ppath, uid_t uid, gid_t gid)
 int fsroot_rmdir(const char *path)
 {
 	struct fsroot_directory *file;
-	char fullpath[PATH_MAX];
 
 	if (!path)
 		return FSROOT_E_BADARGS;
 
 	file = hash_table_get(files, path);
-	if (file == NULL || !S_ISDIR(file->__file.mode))
+	if (file == NULL || !S_ISDIR(file->mode))
 		return FSROOT_E_NOTEXISTS;
 
 	/*
@@ -361,6 +397,7 @@ int fsroot_rmdir(const char *path)
 	if (file->num_entries > 0)
 		return FSROOT_E_NONEMPTY;
 
+	fsroot_remove_file((struct fsroot_file *) file);
 	hash_table_remove(files, path);
 	mm_free(file);
 	return FSROOT_OK;
@@ -375,7 +412,6 @@ int fsroot_rename(const char *path, const char *pnewpath)
 {
 	struct fsroot_file *file;
 	struct fsroot_directory *dst_directory;
-	char full_path[PATH_MAX], full_newpath[PATH_MAX];
 	char *newpath;
 	char **newpath_parts;
 	size_t *newpath_indexes;
@@ -410,7 +446,7 @@ int fsroot_rename(const char *path, const char *pnewpath)
 	/* Compose full path, without the base name (eg. the full destination directory) */
 	newpath = fsroot_full_path((const char **) newpath_parts, newpath_indexes, indexes_len);
 	dst_directory = hash_table_get(files, newpath);
-	if (!dst_directory || !S_ISDIR(dst_directory->__file.mode)) {
+	if (!dst_directory || !S_ISDIR(dst_directory->mode)) {
 		/* The target directory does not exist. This is an error. */
 		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
 	}
@@ -450,7 +486,7 @@ int fsroot_chmod(const char *path, mode_t mode)
 	 * Check that the user is not trying to change file type
 	 * eg. directory to regular file
 	 */
-	if (filetype && ((file->mode & 0170000) != filetype))
+	if (filetype && ((file->mode & S_IFMT) != filetype))
 		return FSROOT_E_BADARGS;
 
 	file->mode = mode;
@@ -468,7 +504,6 @@ int fsroot_chown(const char *path, uid_t uid, gid_t gid)
 	if (!file)
 		return FSROOT_E_NOTEXISTS;
 
-	/* TODO should check that the user and group exist */
 	file->uid = uid;
 	file->gid = gid;
 	return FSROOT_OK;
@@ -487,8 +522,13 @@ int fsroot_opendir(const char *path, struct fsroot_file **outdir)
 		return FSROOT_E_BADARGS;
 
 	dir = hash_table_get(files, path);
-	if (dir && S_ISDIR(dir->__file.mode)) {
+	if (dir && S_ISDIR(dir->mode)) {
 		*outdir = (struct fsroot_file *) dir;
+//		memcpy(outdir, dir, sizeof(struct fsroot_file));
+//		outdir->name = dir->name;
+//		outdir->uid = dir->uid;
+//		outdir->gid = dir->gid;
+//		outdir->mode = dir->mode;
 		retval = FSROOT_OK;
 	} else {
 		retval = FSROOT_E_NOTEXISTS;
@@ -500,7 +540,6 @@ int fsroot_opendir(const char *path, struct fsroot_file **outdir)
 int fsroot_readdir(off_t offset, struct fsroot_file *directory, struct fsroot_file *file)
 {
 	int retval;
-	const char *path;
 	struct fsroot_directory *dir;
 
 	if (!directory || !file)
@@ -534,22 +573,39 @@ int main()
 	 * 	/bar/baz	dir
 	 * 	/bar/baz/test	file
 	 */
-	struct fsroot_directory *dir_foo = fsroot_create_directory(NULL, "foo", 1000, 1000, 0),
-		*dir_bar = fsroot_create_directory(NULL, "bar", 1000, 1000, 0),
-		*dir_baz = fsroot_create_directory(dir_bar, "baz", 1000, 1000, 0);
+	struct fsroot_directory *dir_foo = (struct fsroot_directory *) fsroot_create_file(NULL, "foo", 1000, 1000, S_IFDIR),
+		*dir_bar = (struct fsroot_directory *) fsroot_create_file(NULL, "bar", 1000, 1000, S_IFDIR),
+		*dir_baz = (struct fsroot_directory *) fsroot_create_file(dir_bar, "baz", 1000, 1000, S_IFDIR);
 
 	hash_table_put(files, "/foo", dir_foo);
 	hash_table_put(files, "/bar", dir_bar);
 	hash_table_put(files, "/bar/baz", dir_baz);
 
-	struct fsroot_file *test = fsroot_create_file(NULL, "test", 1000, 1000, 0),
-		*test_foo = fsroot_create_file(dir_foo, "test", 1000, 1000, 0),
-		*test_baz = fsroot_create_file(dir_baz, "test", 1000, 1000, 0);
+	struct fsroot_file *test = fsroot_create_file(NULL, "test", 1000, 1000, S_IFREG),
+//		*test_foo = fsroot_create_file(dir_foo, "test", 1000, 1000, 0),
+		*test_baz = fsroot_create_file(dir_baz, "test", 1000, 1000, S_IFREG);
 
 	hash_table_put(files, "/test", test);
-	hash_table_put(files, "/foo/test", test_foo);
+//	hash_table_put(files, "/foo/test", test_foo);
 	hash_table_put(files, "/bar/baz/test", test_baz);
 
+	struct fsroot_file *dir, file;
+	int retval = fsroot_opendir("/bar/baz", &dir);
+	if (retval == FSROOT_E_NOTEXISTS)
+		goto end;
+
+	fsroot_readdir(0, dir, &file);
+	fsroot_readdir(1, dir, &file);
+
+	char linkpath[PATH_MAX];
+	fsroot_symlink("/TEST", "/test", 1000, 1000);
+	fsroot_symlink("/TEST", "/test2", 1000, 1000);
+	fsroot_readlink("/TEST", linkpath, sizeof(linkpath));
+
+	fsroot_symlink("/bar/baz/TEST", "/test", 1000, 1000);
+	fsroot_readlink("/bar/baz/TEST", linkpath, sizeof(linkpath));
+
+end:
 	hash_table_destroy(files);
 	return 0;
 }
