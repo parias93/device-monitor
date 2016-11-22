@@ -14,4 +14,4 @@ clean:
 	rm $(OUTPUT)
 
 fuse: fuse.c
-	gcc -Wall -g -O0 fuse.c `pkg-config fuse3 --cflags --libs` -Wl,-rpath=/usr/local/lib -o fuse
+	gcc -Wall -g -O0 fuse.c fsroot.c `pkg-config fuse3 --cflags --libs` -Wl,-rpath=/usr/local/lib -o fuse

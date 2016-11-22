@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <fuse.h>
 #include <fuse_lowlevel.h>
+#include "fsroot.h"
 
 static char root_path[PATH_MAX];
 static unsigned int root_path_len;
@@ -91,13 +92,23 @@ static int dm_fuse_getattr(const char *path, struct stat *st, struct fuse_file_i
 	int retval = 0;
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
-		return -EFAULT;
-	if (!st)
+	if (!path || !st)
 		return -EFAULT;
 
-	retval = lstat(fullpath, st);
-	return (retval == 0 ? retval : -errno);
+	switch (fsroot_getattr(path, st)) {
+	case FSROOT_E_BADARGS:
+	case FSROOT_E_BADFORMAT:
+		retval = -EFAULT;
+		break;
+	case FSROOT_E_LIBC:
+		retval = -errno;
+		break;
+	default:
+		retval = 0;
+		break;
+	}
+
+	return retval;
 }
 
 /*
@@ -108,23 +119,23 @@ static int dm_fuse_getattr(const char *path, struct stat *st, struct fuse_file_i
 static int dm_fuse_mknod(const char *path, mode_t mode, dev_t dev)
 {
 	int retval = 0;
-	char fullpath[PATH_MAX];
+	struct fsroot_file_perms perms;
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path)
 		return -EFAULT;
 	if (!S_ISREG(mode))
 		return -EACCES;
 
-	struct fuse_context *ctx = fuse_get_context();
+	retval = fsroot_create_file(path, &perms);
 
-	retval = open(fullpath, O_CREAT | O_EXCL | O_WRONLY, mode);
-	if (retval >= 0) {
-		close(retval);
-		retval = 0;
-	} else if (retval == -1) {
+	if (retval == 0)
+		goto end;
+	if (retval == FSROOT_E_LIBC)
 		retval = -errno;
-	}
+	else
+		retval = -EFAULT;
 
+end:
 	return retval;
 }
 
@@ -137,7 +148,7 @@ static int dm_fuse_symlink(const char *path, const char *link)
 {
 	char full_link[PATH_MAX];
 
-	if (!path || !link || !dm_fullpath(link, full_link, sizeof(full_link)))
+	if (!path || !link || !fsroot_fullpath(link, full_link, sizeof(full_link)))
 		return -EFAULT;
 	return (symlink(path, full_link) == 0 ? 0 : -errno);
 }
@@ -146,34 +157,44 @@ static int dm_fuse_readlink(const char *path, char *buf, size_t buflen)
 {
 	size_t retval = 0;
 	char fullpath[PATH_MAX];
+	struct fsroot_file file;
 
-	if (!path || !buf || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !buf || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
 	retval = readlink(fullpath, buf, buflen - 1);
-	if (retval >= 0) {
-		buf[retval] = '\0';
-		retval = 0;
-	} else {
-		memset(buf, 0, buflen);
+	if (retval < 0) {
 		retval = -errno;
+		goto error;
 	}
 
+	buf[retval] = '\0';
+	retval = fsroot_get_file(path, &file);
+	if (retval == FSROOT_E_LIBC)
+		retval = -errno;
+	else if (retval < 0)
+		retval = -EFAULT;
+
+	if (retval == 0)
+		goto end;
+
+error:
+	memset(buf, 0, buflen);
+end:
 	return retval;
 
 }
 
 /*
  * Create a directory.
+ * TODO check permissions for directories as well (hook through fsroot)
  */
 static int dm_fuse_mkdir(const char *path, mode_t mode)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
-
-	struct fuse_context *ctx = fuse_get_context();
 
 	return mkdir(fullpath, mode);
 }
@@ -185,7 +206,7 @@ static int dm_fuse_unlink(const char *path)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
 	return unlink(fullpath);
@@ -198,7 +219,7 @@ static int dm_fuse_rmdir(const char *path)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
 	return rmdir(fullpath);
@@ -211,9 +232,9 @@ static int dm_fuse_rename(const char *path, const char *newpath, unsigned int fo
 {
 	char fullpath[PATH_MAX], full_newpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
-	if (!newpath || !dm_fullpath(newpath, full_newpath, sizeof(full_newpath)))
+	if (!newpath || !fsroot_fullpath(newpath, full_newpath, sizeof(full_newpath)))
 		return -EFAULT;
 
 	return rename(fullpath, full_newpath);
@@ -221,28 +242,32 @@ static int dm_fuse_rename(const char *path, const char *newpath, unsigned int fo
 
 /*
  * Change the permission bits of a file.
+ * TODO implement. Hook through fsroot.
  */
 static int dm_fuse_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
-	return chmod(fullpath, mode);
+	return -EACCES;
+	//return chmod(fullpath, mode);
 }
 
 /*
  * Change the owner and group of a file.
+ * TODO implement. Hook through fsroot.
  */
 static int dm_fuse_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
-	return chown(fullpath, uid, gid);
+	return -EACCES;
+	//return chown(fullpath, uid, gid);
 }
 
 /*
@@ -252,7 +277,7 @@ static int dm_fuse_truncate(const char *path, off_t newsize, struct fuse_file_in
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
 	return truncate(fullpath, newsize);
@@ -267,18 +292,33 @@ static int dm_fuse_truncate(const char *path, off_t newsize, struct fuse_file_in
  */
 static int dm_fuse_open(const char *path, struct fuse_file_info *fi)
 {
-	int fd;
-	char fullpath[PATH_MAX];
+	int fd, retval = 0;
+	struct fsroot_file file;
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path)
 		return -EFAULT;
 
-	fd = open(fullpath, fi->flags);
-	if (fd < 0)
-		return -1;
+	switch (fsroot_get_file(path, &file)) {
+	case FSROOT_E_BADFORMAT:
+	case FSROOT_E_BADARGS:
+		retval = -EFAULT;
+		break;
+	case FSROOT_E_LIBC:
+		retval = -errno;
+		break;
+	case 0:
+		fd = fsroot_open_file(&file, fi->flags);
 
-	fi->fh = fd;
-	return 0;
+		if (fd < 0)
+			retval = -errno;
+		else
+			fi->fh = fd;
+		break;
+	default:
+		break;
+	}
+
+	return retval;
 }
 
 /*
@@ -318,7 +358,7 @@ static int dm_fuse_opendir(const char *path, struct fuse_file_info *fi)
 	DIR *dp;
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 	if (!fi)
 		return -EFAULT;
@@ -342,39 +382,80 @@ static int dm_fuse_opendir(const char *path, struct fuse_file_info *fi)
  * 	2) The readdir implementation keeps track of the offsets of the directory entries.
  * 	It uses the offset parameter and always passes non-zero offset to the filler function.
  * 	When the buffer is full (or an error happens) the filler function will return '1'.
+ *
+ * TODO implement: this basically requires iterating fsroot.
  */
 static int dm_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags)
 {
 	DIR *dp;
 	struct dirent *de;
+	struct stat st;
+	struct fsroot_file file;
+	int retval = 0;
+	enum fuse_fill_dir_flags filler_flags = (
+			flags == FUSE_READDIR_PLUS ?
+					FUSE_FILL_DIR_PLUS :
+					0);
 	int initial_errno = errno;
 
 	dp = (DIR *) (uintptr_t) fi->fh;
 	de = readdir(dp);
-	if (de == 0)
-		return -1;
+	if (de == NULL) {
+		retval = (errno == initial_errno ? 0 : -errno);
+		goto end;
+	}
 
-	do {
-		if (filler(buf, de->d_name, NULL, 0,
-				(flags == FUSE_READDIR_PLUS ? FUSE_FILL_DIR_PLUS : 0))
-				!= 0)
-			return -ENOMEM;
-	} while ((de = readdir(dp)) != NULL);
+	for (; de != NULL; de = readdir(dp)) {
+		if (stat(de->d_name, &st) == -1) {
+			retval = -errno;
+			goto end;
+		}
 
-	return (errno == initial_errno ? 0 : -1);
+		if (!S_ISREG(st.st_mode)) {
+			if (filler(buf, de->d_name, NULL, 0, filler_flags) != 0) {
+				retval = -ENOMEM;
+				goto end;
+			}
+		} else {
+			switch (fsroot_get_file(de->d_name, &file)) {
+			case 0:
+				/* TODO fsroot_get_file() should directly give us the 'stat' for this file */
+				if (filler(buf, de->d_name, NULL, 0, filler_flags) != 0) {
+					retval = -ENOMEM;
+					goto end;
+				}
+				break;
+			case FSROOT_E_LIBC:
+				retval = -errno;
+				goto end;
+				break;
+			default:
+				retval = -EFAULT;
+				goto end;
+				break;
+			}
+		}
+	}
+
+	if (retval == 0 && errno != initial_errno)
+		retval = -errno;
+
+end:
+	return retval;
 }
 
 /*
  * Check file access permissions.
  * This will be called for access(2), unless the 'default_permissions'
  * mount option is given.
+ * TODO This function should be removed. We'll be invoking this daemon with 'default_permissions' set.
  */
 static int dm_fuse_access(const char *path, int mask)
 {
 	char fullpath[PATH_MAX];
 
-	if (!path || !dm_fullpath(path, fullpath, sizeof(fullpath)))
+	if (!path || !fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return -EFAULT;
 
 	return access(fullpath, mask);
