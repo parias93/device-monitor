@@ -34,7 +34,7 @@
 #define FSROOT_E_NEW_DIRECTORY_NOTEXISTS	-6
 
 #define FSROOT_FILE		\
-	const char *name;	\
+	char *name;		\
 	mode_t mode;		\
 	uid_t uid;		\
 	gid_t gid;		\
@@ -280,7 +280,7 @@ static struct fsroot_file *fsroot_create_file(struct fsroot_directory *dir, cons
 	return file;
 }
 
-static int fsroot_remove_file(struct fsroot_file *file)
+static void fsroot_remove_file(struct fsroot_file *file)
 {
 	int i, j;
 	struct fsroot_directory *dir = (struct fsroot_directory *) file->parent_dir;
@@ -293,10 +293,12 @@ static int fsroot_remove_file(struct fsroot_file *file)
 		}
 
 		if (i < dir->num_entries) {
-			for (j = i; j < dir->num_entries; j++) {
-				if (j + 1 < dir->num_entries)
-					dir->entries[j] = dir->entries[j + 1];
-			}
+			for (j = i; j + 1 < dir->num_entries; j++)
+				dir->entries[j] = dir->entries[j + 1];
+
+			dir->entries[j] = NULL;
+			dir->num_entries--;
+			file->parent_dir = NULL;
 		}
 
 		/* Else file was not found. This should not happen. */
@@ -371,9 +373,14 @@ int fsroot_mkdir(const char *ppath, uid_t uid, gid_t gid)
 		return FSROOT_E_EXISTS;
 
 	directory = fsroot_get_directory(path);
+	if (strcmp(directory, "/") == 0)
+		goto create_file;
+
 	dir = hash_table_get(files, directory);
 	if (!dir)
 		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
+
+create_file:
 	file = (struct fsroot_directory *) fsroot_create_file(dir, path, uid, gid, S_IFDIR);
 	hash_table_put(files, path, file);
 
@@ -399,6 +406,7 @@ int fsroot_rmdir(const char *path)
 
 	fsroot_remove_file((struct fsroot_file *) file);
 	hash_table_remove(files, path);
+	mm_free(file->name);
 	mm_free(file);
 	return FSROOT_OK;
 }
@@ -411,11 +419,8 @@ int fsroot_rmdir(const char *path)
 int fsroot_rename(const char *path, const char *pnewpath)
 {
 	struct fsroot_file *file;
-	struct fsroot_directory *dst_directory;
-	char *newpath;
-	char **newpath_parts;
-	size_t *newpath_indexes;
-	size_t parts_len, indexes_len;
+	struct fsroot_directory *path_dir = NULL, *newpath_dir = NULL;
+	char *path_directory, *newpath_directory;
 
 	if (!path || !pnewpath)
 		return FSROOT_E_BADARGS;
@@ -432,26 +437,18 @@ int fsroot_rename(const char *path, const char *pnewpath)
 	 * original and new directory are the same
 	 */
 
-	/* Tokenize newpath */
-	newpath_parts = fsroot_path_split(pnewpath, &parts_len);
-	if (!newpath_parts || !parts_len)
-		return FSROOT_E_BADARGS;
-
-	newpath_indexes = fsroot_compute_path_indexes((const char **) newpath_parts, parts_len, &indexes_len);
-	if (!newpath_indexes || !indexes_len)
-		return FSROOT_E_BADARGS;
-
-	/* Do not count for the base name */
-	indexes_len--;
-	/* Compose full path, without the base name (eg. the full destination directory) */
-	newpath = fsroot_full_path((const char **) newpath_parts, newpath_indexes, indexes_len);
-	dst_directory = hash_table_get(files, newpath);
-	if (!dst_directory || !S_ISDIR(dst_directory->mode)) {
-		/* The target directory does not exist. This is an error. */
-		return FSROOT_E_NEW_DIRECTORY_NOTEXISTS;
+	path_directory = fsroot_get_directory(path);
+	newpath_directory = fsroot_get_directory(pnewpath);
+	if (strcmp(path_directory, "/")) {
+		path_dir = hash_table_get(files, path_directory);
+		if (!path_dir)
+			return FSROOT_E_NOTEXISTS;
 	}
-	mm_free(newpath_indexes);
-	mm_free(newpath_parts);
+	if (strcmp(newpath_directory, "/")) {
+		newpath_dir = hash_table_get(files, newpath_directory);
+		if (!newpath_dir)
+			return FSROOT_E_NOTEXISTS;
+	}
 
 	/*
 	 * Tell the parent directory that this file is no longer
@@ -464,8 +461,14 @@ int fsroot_rename(const char *path, const char *pnewpath)
 	 * Now add the file to the new destination directory.
 	 * Then put the whole path in the hash table.
 	 */
-	__fsroot_create_file(dst_directory, file);
-	hash_table_put(files, newpath, file);
+	__fsroot_create_file(newpath_dir, file);
+	hash_table_put(files, pnewpath, file);
+
+	/*
+	 * TODO need to copy the new base name
+	 *
+	 * 	file->name = fsroot_get_basename(pnewpath)
+	 */
 
 	return FSROOT_OK;
 }
@@ -597,13 +600,23 @@ int main()
 	fsroot_readdir(0, dir, &file);
 	fsroot_readdir(1, dir, &file);
 
-	char linkpath[PATH_MAX];
-	fsroot_symlink("/TEST", "/test", 1000, 1000);
-	fsroot_symlink("/TEST", "/test2", 1000, 1000);
-	fsroot_readlink("/TEST", linkpath, sizeof(linkpath));
+//	char linkpath[PATH_MAX];
+//	fsroot_symlink("/TEST", "/test", 1000, 1000);
+//	fsroot_symlink("/TEST", "/test2", 1000, 1000);
+//	fsroot_readlink("/TEST", linkpath, sizeof(linkpath));
+//
+//	fsroot_symlink("/bar/baz/TEST", "/test", 1000, 1000);
+//	fsroot_readlink("/bar/baz/TEST", linkpath, sizeof(linkpath));
 
-	fsroot_symlink("/bar/baz/TEST", "/test", 1000, 1000);
-	fsroot_readlink("/bar/baz/TEST", linkpath, sizeof(linkpath));
+	fsroot_mkdir("/foo/bar", 1000, 1000);
+	fsroot_mkdir("/foo/bar", 1000, 1000);
+	fsroot_rmdir("/foo/bar");
+
+	fsroot_chmod("/bar/baz/test", 0777);
+	fsroot_chown("/bar/baz/test", 2000, 1000);
+
+	fsroot_rename("/bar/baz/test", "/bar/baz/TEST");
+	fsroot_rename("/bar/baz/TEST", "/foo/test");
 
 end:
 	hash_table_destroy(files);
