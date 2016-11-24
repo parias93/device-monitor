@@ -208,6 +208,36 @@ error:
 	return NULL;
 }
 
+static char *fsroot_get_basename(const char *path)
+{
+	char *basename = NULL;
+	char **parts = NULL;
+	size_t *indexes = NULL;
+	size_t parts_len, indexes_len;
+
+	parts = fsroot_path_split(path, &parts_len);
+	if (!parts || !parts_len)
+		goto end;
+	if (parts_len == 1) {
+		basename = strdup(parts[0]);
+		goto end;
+	}
+
+	indexes = fsroot_compute_path_indexes((const char **) parts, parts_len, &indexes_len);
+	if (!indexes || !indexes_len)
+		goto end;
+
+	basename = strdup(parts[indexes[indexes_len - 1]]);
+
+end:
+	for (size_t i = 0; i < parts_len; i++)
+		mm_free(parts[i]);
+	mm_free(indexes);
+	mm_free(parts);
+
+	return basename;
+}
+
 /*
  * Returns 1 if user and group *both* exist, 0 otherwise.
  * Optionally, returns the user's umask in the 'umask' field.
@@ -420,9 +450,13 @@ int fsroot_rename(const char *path, const char *pnewpath)
 {
 	struct fsroot_file *file;
 	struct fsroot_directory *path_dir = NULL, *newpath_dir = NULL;
-	char *path_directory, *newpath_directory;
+	char *path_directory, *newpath_directory, *new_basename;
 
 	if (!path || !pnewpath)
+		return FSROOT_E_BADARGS;
+
+	new_basename = fsroot_get_basename(pnewpath);
+	if (!new_basename)
 		return FSROOT_E_BADARGS;
 
 	file = hash_table_get(files, path);
@@ -461,14 +495,10 @@ int fsroot_rename(const char *path, const char *pnewpath)
 	 * Now add the file to the new destination directory.
 	 * Then put the whole path in the hash table.
 	 */
+	mm_free(file->name);
+	file->name = new_basename;
 	__fsroot_create_file(newpath_dir, file);
 	hash_table_put(files, pnewpath, file);
-
-	/*
-	 * TODO need to copy the new base name
-	 *
-	 * 	file->name = fsroot_get_basename(pnewpath)
-	 */
 
 	return FSROOT_OK;
 }
@@ -617,6 +647,8 @@ int main()
 
 	fsroot_rename("/bar/baz/test", "/bar/baz/TEST");
 	fsroot_rename("/bar/baz/TEST", "/foo/test");
+	fsroot_rename("/test", "/foo/TEST");
+	fsroot_rename("/foo/test", "/test");
 
 end:
 	hash_table_destroy(files);
