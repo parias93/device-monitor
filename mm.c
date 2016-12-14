@@ -22,6 +22,11 @@ void *mm_reallocn(void *ptr, size_t count, size_t len)
 	return newptr;
 }
 
+void *mm_realloc(void *ptr, size_t count)
+{
+	return mm_reallocn(ptr, count, 1);
+}
+
 void __attribute__((__malloc__)) *mm_malloc0(size_t len)
 {
 	return mm_mallocn0(1, len);
