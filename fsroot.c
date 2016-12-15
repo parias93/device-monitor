@@ -69,6 +69,7 @@ static struct {
 	struct fsroot_file_descriptor **file_descriptors;
 	size_t num_files;
 	size_t num_slots;
+	pthread_rwlock_t rwlock;
 } open_files;
 
 /*
@@ -177,9 +178,11 @@ end:
  *
  * 	return open_files.num_files++;
  */
-static int __fsroot_open(struct fsroot_file *file, int flags)
+static size_t __fsroot_open(struct fsroot_file *file, int flags)
 {
 	struct fsroot_file_descriptor *fildes = mm_new0(struct fsroot_file_descriptor);
+	size_t retval;
+
 	if (flags & O_RDONLY == O_RDONLY) {
 		fildes->can_read = 1;
 	} else if (flags & O_WRONLY == O_WRONLY) {
@@ -195,15 +198,20 @@ static int __fsroot_open(struct fsroot_file *file, int flags)
 	 * Finally, add the file descriptor to the array of open files,
 	 * resizing the array if needed.
 	 */
+	pthread_rwlock_wrlock(&open_files.rwlock);
 	if (open_files.num_files == open_files.num_slots) {
 		open_files.num_slots <<= 1;
+		/* FIXME: if mm_reallocn() fails, the lock remains held (handle this in the no-mem callback) */
 		open_files.file_descriptors = mm_reallocn(open_files.file_descriptors,
 				open_files.num_slots,
 				sizeof(struct fsroot_file_descriptor *));
 	}
 
 	open_files.file_descriptors[open_files.num_files] = fildes;
-	return open_files.num_files++;
+	retval = open_files.num_files++;
+	pthread_rwlock_unlock(&open_files.rwlock);
+
+	return retval;
 }
 
 static unsigned int __fsroot_close(struct fsroot_file *file)
@@ -211,6 +219,7 @@ static unsigned int __fsroot_close(struct fsroot_file *file)
 	struct fsroot_file_descriptor *fildes, **file_descriptors;
 	unsigned int num_files = 0, num_deleted_files = 0;
 
+	pthread_rwlock_wrlock(&open_files.rwlock);
 	/*
 	 * Walk through all the file descriptors
 	 * and mark as deleted those that refer to this file.
@@ -241,6 +250,7 @@ static unsigned int __fsroot_close(struct fsroot_file *file)
 	xfree(open_files.file_descriptors);
 	open_files.file_descriptors = file_descriptors;
 	open_files.num_files = num_files;
+	pthread_rwlock_unlock(&open_files.rwlock);
 
 	return num_deleted_files;
 }
@@ -380,14 +390,21 @@ int fsroot_read(int fd, char *buf, size_t size, off_t offset, int *error_out)
 
 	if (!buf || !size || fd < 0)
 		return FSROOT_E_BADARGS;
-	if (fd >= open_files.num_files)
+
+	pthread_rwlock_rdlock(&open_files.rwlock);
+
+	if (fd >= open_files.num_files) {
+		pthread_rwlock_unlock(&open_files.rwlock);
 		return FSROOT_E_BADARGS;
+	}
 
 	/*
 	 * TODO maybe we should add additional sanity checks here,
 	 * like checking the PID of the reader.
 	 */
 	fildes = open_files.file_descriptors[fd];
+	pthread_rwlock_unlock(&open_files.rwlock);
+
 	if (!fildes->can_read) {
 		/* ERROR: this file was not open for reading */
 		retval = FSROOT_E_SYSCALL;
@@ -440,14 +457,21 @@ int fsroot_write(int fd, char *buf, size_t size, off_t offset, int *error_out)
 
 	if (!buf || !size || fd < 0)
 		return FSROOT_E_BADARGS;
-	if (fd >= open_files.num_files)
+
+	pthread_rwlock_rdlock(&open_files.rwlock);
+
+	if (fd >= open_files.num_files) {
+		pthread_rwlock_unlock(&open_files.rwlock);
 		return FSROOT_E_BADARGS;
+	}
 
 	/*
 	 * TODO maybe we should add additional sanity checks here,
 	 * like checking the PID of the reader.
 	 */
 	fildes = open_files.file_descriptors[fd];
+	pthread_rwlock_unlock(&open_files.rwlock);
+
 	if (!fildes->can_write) {
 		/* ERROR: this file was not opened for writing */
 		retval = FSROOT_E_SYSCALL;
