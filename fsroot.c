@@ -33,6 +33,7 @@
 #define FSROOT_E_NOMEM		-4
 #define FSROOT_E_SYSCALL	-5
 #define FSROOT_EOF		-6
+#define FSROOT_E_NOTOPEN	-7
 
 struct fsroot_file {
 	const char *path;
@@ -41,11 +42,11 @@ struct fsroot_file {
 	gid_t gid;
 	off_t cur_offset;
 	struct {
-		int is_open   : 1;
 		int append    : 1;
 		int sync      : 1;
 		int sync_read : 1;
 		int tmpfile   : 1;
+		int is_synced : 1;
 	} flags;
 	pthread_rwlock_t rwlock;
 	char *buf;
@@ -54,7 +55,8 @@ struct fsroot_file {
 
 struct fsroot_file_descriptor {
 	int8_t can_read,
-		can_write;
+		can_write,
+		deleted;
 	struct fsroot_file *file;
 };
 
@@ -146,6 +148,30 @@ static struct fsroot_file *fsroot_create_file(const char *path, uid_t uid, gid_t
 	return file;
 }
 
+static int fsroot_sync_file(struct fsroot_file *file)
+{
+	int retval = FSROOT_OK, fd;
+
+	/* If file has no buffer, it has already be synced */
+	if (!file->buf)
+		goto end;
+
+	fd = open(file->path, O_WRONLY | O_EXCL);
+	if (fd == -1) {
+		retval = FSROOT_E_SYSCALL;
+		goto end;
+	}
+
+	pthread_rwlock_rdlock(&file->rwlock);
+	write(fd, file->buf, file->buf_len);
+	pthread_rwlock_unlock(&file->rwlock);
+	fsync(fd);
+	close(fd);
+
+end:
+	return retval;
+}
+
 /*
  * TODO take a look at this in the disassembler:
  *
@@ -178,6 +204,45 @@ static int __fsroot_open(struct fsroot_file *file, int flags)
 
 	open_files.file_descriptors[open_files.num_files] = fildes;
 	return open_files.num_files++;
+}
+
+static unsigned int __fsroot_close(struct fsroot_file *file)
+{
+	struct fsroot_file_descriptor *fildes, **file_descriptors;
+	unsigned int num_files = 0, num_deleted_files = 0;
+
+	/*
+	 * Walk through all the file descriptors
+	 * and mark as deleted those that refer to this file.
+	 */
+	for (unsigned int i = 0; i < open_files.num_files; i++) {
+		fildes = open_files.file_descriptors[i];
+		if (fildes->file == file) {
+			fildes->deleted = 1;
+			num_deleted_files++;
+		}
+	}
+
+	file_descriptors = mm_new(open_files.num_slots,
+			struct fsroot_file_descriptor *);
+
+	/*
+	 * Copy all the non-deleted file descriptors to the new array,
+	 * and free the deleted ones.
+	 */
+	for (unsigned int i = 0; i < open_files.num_files; i++) {
+		fildes = open_files.file_descriptors[i];
+		if (!fildes->deleted)
+			file_descriptors[num_files++] = fildes;
+		else
+			xfree(fildes);
+	}
+
+	xfree(open_files.file_descriptors);
+	open_files.file_descriptors = file_descriptors;
+	open_files.num_files = num_files;
+
+	return num_deleted_files;
 }
 
 int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags, int *error_out)
@@ -300,24 +365,6 @@ int fsroot_open(const char *path, int flags)
 
 	__fsroot_open(file, flags);
 //	file->num_file_descriptors++;
-	return retval;
-}
-
-int fsroot_close_all(const char *path)
-{
-	int retval = FSROOT_OK;
-	struct fsroot_file *file;
-
-	if (!path)
-		return FSROOT_E_BADARGS;
-
-	file = hash_table_get(files, path);
-	if (!file || !S_ISREG(file))
-		return FSROOT_E_NOTEXISTS;
-
-	/* TODO implement this function */
-	fsroot_close_all_file_descriptors(file);
-
 	return retval;
 }
 
@@ -458,22 +505,22 @@ int fsroot_release(const char *path)
 	file = hash_table_get(files, path);
 	if (!file || !S_ISREG(file->mode))
 		return FSROOT_E_NOTEXISTS;
-	if (!file->flags.is_open)
+
+	if (!__fsroot_close(file))
 		return FSROOT_E_NOTOPEN;
 
 	if (!file->flags.is_synced)
 		fsroot_sync_file(file);
-	if (file->fd)
-		close(file->fd);
-
-	fsroot_close_file(file);
-
 	if (file->flags.tmpfile)
 		unlink(path);
 
 	if (file->buf) {
-		xfree(file->buf);
-		file->buf_len = 0;
+		pthread_rwlock_wrlock(&file->rwlock);
+		if (file->buf) {
+			xfree(file->buf);
+			file->buf_len = 0;
+		}
+		pthread_rwlock_unlock(&file->rwlock);
 	}
 
 	return retval;
