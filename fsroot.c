@@ -42,9 +42,7 @@ struct fsroot_file {
 	gid_t gid;
 	off_t cur_offset;
 	struct {
-		int append    : 1;
 		int sync      : 1;
-		int sync_read : 1;
 		int tmpfile   : 1;
 		int is_synced : 1;
 	} flags;
@@ -169,6 +167,7 @@ static int fsroot_sync_file(struct fsroot_file *file)
 	fsync(fd);
 	close(fd);
 
+	file->flags.is_synced = 1;
 end:
 	return retval;
 }
@@ -303,10 +302,17 @@ int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags
 		/* We simply ignore O_EXCL, since we pass it to open(2) anyway */
 		flags ^= O_EXCL;
 	}
-	if (flags & O_APPEND == O_APPEND) {
-		flags ^= O_APPEND;
-		file->flags.append = 1;
-	}
+//	TODO this is not needed since we're not handling file offsets ourselves in the end
+//	if (flags & O_APPEND == O_APPEND) {
+//		flags ^= O_APPEND;
+//		file->flags.append = 1;
+//	}
+	/*
+	 * FIXME
+	 * The difference between O_SYNC and O_DSYNC is that the former also writes
+	 * file metadata. We're leaving this for later and treat both identically,
+	 * as we're keeping all file metadata in memory for now.
+	 */
 #ifdef O_DSYNC
 	if (flags & O_DSYNC == O_DSYNC) {
 		flags ^= O_DSYNC;
@@ -317,7 +323,7 @@ int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags
 	/* In Linux, O_SYNC is equivalent to O_RSYNC */
 	if (flags & O_SYNC == O_SYNC) {
 		flags ^= O_SYNC;
-		file->flags.sync_read = 1;
+		file->flags.sync = 1;
 	}
 #endif
 #ifdef O_TMPFILE
@@ -507,6 +513,10 @@ int fsroot_write(int fd, char *buf, size_t size, off_t offset, int *error_out)
 
 	for (idx = offset; idx < size; idx++)
 		file->buf[idx] = *(buf++);
+
+	file->flags.is_synced = 0;
+	if (file->flags.sync)
+		fsroot_sync_file(file);
 
 end:
 	pthread_rwlock_unlock(&file->rwlock);
