@@ -15,3 +15,6 @@ clean:
 
 fuse: fuse.c
 	gcc -Wall -g -O0 fuse.c fsroot.c `pkg-config fuse3 --cflags --libs` -Wl,-rpath=/usr/local/lib -o fuse
+
+fsroot: fsroot.c
+	gcc -std=gnu99 -Wall -Wno-parentheses -g -O0 fsroot.c hash.c mm.c -o fsroot -pthread

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <malloc.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/limits.h>
@@ -17,14 +18,6 @@
 #include "hash.h"
 #include "mm.h"
 
-/*
- * TODO
- *  - Implement fsroot_getattr()
- *  - Get the umask for the user calling us
- *  - Check that user & group exist
- *  - What happens when we have "../../..", etc?
- *  - Array & memory management utilities
- */
 #define FSROOT_NOMORE		 1
 #define FSROOT_OK		 0
 #define FSROOT_E_BADARGS	-1
@@ -59,31 +52,50 @@ struct fsroot_file_descriptor {
 };
 
 static struct hash_table *files;
-/*
- * TODO this should be initialized in fsroot_init()
- * with some sensible defaults
- */
+
 static struct {
 	struct fsroot_file_descriptor **file_descriptors;
 	size_t num_files;
 	size_t num_slots;
+#define OPEN_FILES_INITIAL_NUM_SLOTS 5
 	pthread_rwlock_t rwlock;
 } open_files;
 
-/*
- * Returns 1 if user and group *both* exist, 0 otherwise.
- * Optionally, returns the user's umask in the 'umask' field.
- */
-static int fsroot_get_user(uid_t uid, gid_t gid, mode_t *umask)
-{
-	// TODO implement
-	return 0;
-}
+static char root_path[PATH_MAX];
+static unsigned int root_path_len;
 
-static mode_t fsroot_umask()
+static int fsroot_fullpath(const char *in, char *out, size_t outlen)
 {
-	/* rw-r--r-- */
-	return 0644;
+#define FIRST_CHAR(v) (v[0])
+#define LAST_CHAR(v) (v[v##_len - 1])
+	char must_add_slash = 0, slash = '/';
+
+	if (!in || !out || outlen == 0)
+		return 0;
+
+	size_t in_len = strlen(in);
+	size_t ttl_len = root_path_len + in_len + 1;
+
+	if (LAST_CHAR(root_path) != '/' && FIRST_CHAR(in) != '/') {
+		ttl_len++;
+		must_add_slash = 1;
+	} else if (LAST_CHAR(root_path) == '/' && FIRST_CHAR(in) == '/') {
+		in++;
+		ttl_len--;
+	}
+
+	if (outlen < ttl_len)
+		return 0;
+
+	strcpy(out, root_path);
+	if (must_add_slash)
+		strncat(out, &slash, 1);
+	strcat(out, in);
+
+	fprintf(stderr, "DEBUG: fullpath = %s\n", out);
+	return 1;
+#undef FIRST_CHAR
+#undef LAST_CHAR
 }
 
 static int fsroot_create_file_buffer(struct fsroot_file *file, int *error_out)
@@ -123,7 +135,7 @@ end:
 
 error:
 	if (file->buf)
-		xfree(file->buf);
+		mm_free(file->buf);
 	if (fp)
 		fclose(fp);
 	if (error_out)
@@ -172,11 +184,6 @@ end:
 	return retval;
 }
 
-/*
- * TODO take a look at this in the disassembler:
- *
- * 	return open_files.num_files++;
- */
 static size_t __fsroot_open(struct fsroot_file *file, int flags)
 {
 	struct fsroot_file_descriptor *fildes = mm_new0(struct fsroot_file_descriptor);
@@ -243,10 +250,10 @@ static unsigned int __fsroot_close(struct fsroot_file *file)
 		if (!fildes->deleted)
 			file_descriptors[num_files++] = fildes;
 		else
-			xfree(fildes);
+			mm_free(fildes);
 	}
 
-	xfree(open_files.file_descriptors);
+	mm_free(open_files.file_descriptors);
 	open_files.file_descriptors = file_descriptors;
 	open_files.num_files = num_files;
 	pthread_rwlock_unlock(&open_files.rwlock);
@@ -254,6 +261,34 @@ static unsigned int __fsroot_close(struct fsroot_file *file)
 	return num_deleted_files;
 }
 
+/**
+ * \param[in] path Relative path to a file
+ * \param[in] uid UID of the owner
+ * \param[in] gid GID of the owner
+ * \param[in] mode File mode (`mode_t`)
+ * \param[in] flags File creation flags (see `open(2)`)
+ * \param[out] error_out pointer to an integer where the value of `errno` will be placed, on error
+ * \return a positive file descriptor to the created file on success, or a negative integer on error
+ *
+ * Creates a new file and opens it, as if it was followed by a call to fsroot_open().
+ *
+ * \p path must not exist with fsroot. If an existing path is passed, fsroot_create() returns
+ * immediately `FSROOT_E_EXISTS` and goes no further.
+ *
+ * \p mode should specify a regular file. Non-regular files, such as symlinks, directories or TTYs
+ * will be rejected, causing fsroot_create() to return `FSROOT_E_BADARGS`.
+ *
+ * If the call to the underlying OS services fails, or if some invalid flags are passed that otherwise
+ * prevent this function from running correctly (such as passing the `O_DIRECTORY` flag), `FSROOT_E_SYSCALL`
+ * is returned, and the value of the `errno` variable will be placed in the memory pointed to by \p error_out,
+ * if provided.
+ *
+ * The following flags are invalid, and will cause fsroot_create() to return `FSROOT_E_SYSCALL`:
+ *  - O_ASYNC
+ *  - O_DIRECTORY
+ *  - O_NOCTTY
+ *  - O_NOFOLLOW
+ */
 int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags, int *error_out)
 {
 	int error = 0, retval = FSROOT_OK, fd;
@@ -297,11 +332,13 @@ int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags
 	 * 	- O_TMPFILE
 	 *
 	 * Thus, if they're present in 'flags', we strip them out.
+	 *
+	 * We also strip out O_EXCL and O_CREAT, since we pass them to open(2) anyway.
 	 */
-	if (flags & O_EXCL == O_EXCL) {
-		/* We simply ignore O_EXCL, since we pass it to open(2) anyway */
+	if (flags & O_EXCL == O_EXCL)
 		flags ^= O_EXCL;
-	}
+	if (flags & O_CREAT == O_CREAT)
+		flags ^= O_CREAT;
 //	TODO this is not needed since we're not handling file offsets ourselves in the end
 //	if (flags & O_APPEND == O_APPEND) {
 //		flags ^= O_APPEND;
@@ -365,10 +402,21 @@ end:
 	return retval;
 }
 
+/**
+ * \param[in] path Relative path to a file
+ * \param[in] flags Flags (see `open(2)`)
+ * \return a positive file descriptor on success, or a negative integer on error
+ *
+ * \p path must specify an already existing file. If the file does not exist,
+ * fsroot_open() immediately returns `FSROOT_E_NOTEXISTS` and goes no further.
+ *
+ * This function does not create new files. Use fsroot_create() for that instead.
+ * This function will not complain if file creation (`O_CREATE`, `O_EXCL` )
+ * or truncation (`O_TRUNC`) flags are passed, but they will be completely ignored.
+ */
 int fsroot_open(const char *path, int flags)
 {
 	int retval = FSROOT_OK;
-	int pos;
 	struct fsroot_file *file;
 
 	if (!path || !flags)
@@ -376,7 +424,7 @@ int fsroot_open(const char *path, int flags)
 
 	/* File must exist, due to a previous call to fsroot_create() */
 	file = hash_table_get(files, path);
-	if (!file || !S_ISREG(file))
+	if (!file || !S_ISREG(file->mode))
 		return FSROOT_E_NOTEXISTS;
 
 	__fsroot_open(file, flags);
@@ -385,11 +433,32 @@ int fsroot_open(const char *path, int flags)
 }
 
 /**
- * Should return the number of bytes read.
+ * \param[in] fd a valid file descriptor, obtained by a previous call to fsroot_create() or fsroot_open()
+ * \param[out] buf pointer to a buffer where the read data will be placed
+ * \param[in] size number of bytes to read
+ * \param[in] offset offset to start reading from
+ * \param[out] error_out pointer to an integer where the value of `errno` will be placed, on error
+ * \return the number of bytes read, or a negative error code on error
+ *
+ * This function will read up to \p size bytes from the file referred to by file descriptor \p fd
+ * starting at offset \p offset, and place the content in the buffer pointed to by \p buf.
+ * The caller must supply a buffer of at least \p size length.
+ *
+ * This function returns the number of bytes read from the file and placed into \p buf,
+ * which might be less than \p size. This should happen when the end of the file is reached
+ * before \p size bytes were read. If this happens, `FSROOT_EOF` will be placed in \p error_out
+ * (even though a positive number was returned).
+ *
+ * If the file was not open for reading (neither `O_RDONLY` nor `O_RDWR` were passed to
+ * fsroot_create() or fsroot_open()) then `FSROOT_E_SYSCALL` will be returned and \p error_out
+ * will be set to `EBADF`. If an error happens in some of the underlying OS services, `FSROOT_E_SYSCALL`
+ * is returned and \p error_out is set to the value of `errno`.
+ *
+ * If an error happens, \p buf will not be modified in any way.
  */
 int fsroot_read(int fd, char *buf, size_t size, off_t offset, int *error_out)
 {
-	int retval, error;
+	int retval, error = 0;
 	unsigned int idx;
 	struct fsroot_file *file;
 	struct fsroot_file_descriptor *fildes;
@@ -422,15 +491,14 @@ int fsroot_read(int fd, char *buf, size_t size, off_t offset, int *error_out)
 	if (file->buf == NULL) {
 		pthread_rwlock_wrlock(&file->rwlock);
 		if (file->buf == NULL)
-			retval = fsroot_create_file_buffer(file);
+			retval = fsroot_create_file_buffer(file, &error);
 		pthread_rwlock_unlock(&file->rwlock);
 
 		if (retval == -1) {
 			retval = FSROOT_E_SYSCALL;
-			error = EINVAL;
 			goto end;
 		} else if (retval == 0 && file->buf == NULL) {
-			retval = FSROOT_EOF;
+			error = FSROOT_EOF;
 			goto end;
 		}
 	}
@@ -440,19 +508,36 @@ int fsroot_read(int fd, char *buf, size_t size, off_t offset, int *error_out)
 		*(buf++) = file->buf[idx];
 	pthread_rwlock_unlock(&file->rwlock);
 
-	if (idx == size)
-		retval = idx;
-	else if (idx == file->buf_len)
-		retval = FSROOT_EOF;
+	retval = idx;
+	if (idx < size)
+		error = FSROOT_EOF;
+
 end:
-	if (retval == FSROOT_E_SYSCALL && error_out)
+	if (error_out && error != 0)
 		*error_out = error;
 
 	return retval;
 }
 
 /**
- * Returns the number of bytes written.
+ * \param[in] fd a valid file descriptor, obtained by a previous call to fsroot_create() or fsroot_open()
+ * \param[in] buf pointer to a buffer to take data from
+ * \param[in] size length of the buffer
+ * \param[in] offset offset to start writing from
+ * \param[out] error_out pointer to an integer where the value `errno` will be placed, on error
+ * \return the number of bytes written, or a negative error code on error
+ *
+ * This function will write \p size bytes from \p buf to the file referred to by \p fd, starting
+ * at offset \p offset. If the end of the file is reached, the file is resized until, at least,
+ * the remaining bytes can be written.
+ *
+ * This function returns the number of bytes written from \p buf to the file.
+ *
+ * If the file was not open for writing () then `FSROOT_E_SYSCALL` is returned and \p error_out
+ * will be set to `EBADF`. If an error happens in some of the underlying OS services, `FSROOT_E_SYSCALL`
+ * is returned and \p error_out is set to the value of `errno`.
+ *
+ * If an error happens, the file will not be modified in any way.
  */
 int fsroot_write(int fd, char *buf, size_t size, off_t offset, int *error_out)
 {
@@ -489,14 +574,10 @@ int fsroot_write(int fd, char *buf, size_t size, off_t offset, int *error_out)
 	pthread_rwlock_wrlock(&file->rwlock);
 
 	if (file->buf == NULL) {
-		retval = fsroot_create_file_buffer(file);
+		retval = fsroot_create_file_buffer(file, &error);
 
 		if (retval == -1) {
 			retval = FSROOT_E_SYSCALL;
-			error = EINVAL;
-			goto end;
-		} else if (retval == 0 && file->buf == NULL) {
-			retval = FSROOT_EOF;
 			goto end;
 		}
 		retval = FSROOT_OK;
@@ -505,10 +586,15 @@ int fsroot_write(int fd, char *buf, size_t size, off_t offset, int *error_out)
 	if (offset + size >= file->buf_len) {
 		/*
 		 * Attempting to write past the end of file,
-		 * so resize the buffer
+		 * so resize the buffer. Beware file->buf might be NULL here.
+		 * If we pass a NULL pointer to mm_realloc() it should just behave like
+		 * malloc(). But this is not guaranteed for older implementations, and it is
+		 * cheap to guard against this, so let's do it.
 		 */
 		file->buf_len <<= 1;
-		file->buf = mm_realloc(file->buf, file->buf_len);
+		file->buf = (file->buf ?
+				mm_realloc(file->buf, file->buf_len) :
+				mm_malloc0(file->buf_len));
 	}
 
 	for (idx = offset; idx < size; idx++)
@@ -528,6 +614,23 @@ end_nolock:
 	return retval;
 }
 
+/**
+ * \param path Relative path to a file
+ * \return `FSROOT_OK` on success, or a negative integer on error
+ *
+ * This function will destroy all the open file descriptors for the
+ * specified by the path \p path. All the file descriptors for this file
+ * (obtained with fsroot_create() and fsroot_open()) will no longer be valid,
+ * and **calling fsroot_read() and fsroot_write() with either of these will have
+ * undefined effects**.
+ *
+ * This function will sync the file to the underlying hardware media. If the file was marked
+ * as temporary (`O_TMPFILE` was passed to fsroot_create() or fsroot_open()) the file is removed.
+ *
+ * If the specified file does not exist this function returns `FSROOT_E_NOTEXISTS`.
+ * If the file exists but there are no file descriptors associated with it this function
+ * returns `FSROOT_E_NOTOPEN`.
+ */
 int fsroot_release(const char *path)
 {
 	int retval = FSROOT_OK;
@@ -543,15 +646,15 @@ int fsroot_release(const char *path)
 	if (!__fsroot_close(file))
 		return FSROOT_E_NOTOPEN;
 
-	if (!file->flags.is_synced)
-		fsroot_sync_file(file);
 	if (file->flags.tmpfile)
 		unlink(path);
+	else if (!file->flags.is_synced)
+		fsroot_sync_file(file);
 
 	if (file->buf) {
 		pthread_rwlock_wrlock(&file->rwlock);
 		if (file->buf) {
-			xfree(file->buf);
+			mm_free(file->buf);
 			file->buf_len = 0;
 		}
 		pthread_rwlock_unlock(&file->rwlock);
@@ -564,7 +667,6 @@ int fsroot_getattr(const char *path, struct stat *out_st)
 {
 	struct stat st;
 	struct fsroot_file *file;
-	int retval = FSROOT_OK;
 
 	if (!path || !out_st)
 		return FSROOT_E_BADARGS;
@@ -576,9 +678,9 @@ int fsroot_getattr(const char *path, struct stat *out_st)
 	if (stat(path, &st) == -1)
 		return FSROOT_E_SYSCALL;
 
-	st->st_mode = file->mode;
-	st->st_uid = file->uid;
-	st->st_gid = file->gid;
+	st.st_mode = file->mode;
+	st.st_uid = file->uid;
+	st.st_gid = file->gid;
 	memcpy(out_st, &st, sizeof(struct stat));
 
 	return FSROOT_OK;
@@ -816,7 +918,39 @@ void fsroot_closedir(void *dir)
 	closedir((DIR *) dir);
 }
 
-void *fsroot_init(mode_t mask)
+void fsroot_deinit()
 {
-	mode_t umask = mask & 0777;
+	pthread_rwlock_wrlock(&open_files.rwlock);
+
+	for (unsigned int i = 0; i < open_files.num_files; i++)
+		mm_free(open_files.file_descriptors[i]);
+
+	mm_free(open_files.file_descriptors);
+	open_files.num_slots = 0;
+	open_files.num_files = 0;
+
+	pthread_rwlock_unlock(&open_files.rwlock);
+	pthread_rwlock_destroy(&open_files.rwlock);
+}
+
+int fsroot_init(const char *root)
+{
+	if (!root)
+		return FSROOT_E_BADARGS;;
+
+	open_files.num_files = 0;
+	open_files.num_slots = OPEN_FILES_INITIAL_NUM_SLOTS;
+	open_files.file_descriptors = mm_mallocn0(open_files.num_slots,
+			sizeof(struct fsroot_file_descriptor *));
+	pthread_rwlock_init(&open_files.rwlock, NULL);
+
+	root_path_len = strlen(root);
+	if (root_path_len > sizeof(root_path) - 1)
+		goto error_nomem;
+	strcpy(root_path, root);
+
+	return FSROOT_OK;
+error_nomem:
+	fsroot_deinit();
+	return FSROOT_E_NOMEM;
 }
