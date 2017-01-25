@@ -6,9 +6,5 @@ ACLOCAL_AMFLAGS = -I m4
 
 lib_LTLIBRARIES = libfsroot.la
 libfsroot_la_SOURCES = fsroot.c hash.c mm.c
-
-bin_PROGRAMS = fsroot
-fsroot_SOURCES = fsroot-main.c
-fsroot_LDADD = libfsroot.la
-fsroot_LDFLAGS = -pthread
+libfsroot_la_LDFLAGS = -pthread
 

@@ -148,16 +148,24 @@ error:
 /*
  * Returns a negative number on error,
  * or else the file descriptor.
+ * FIXME Maybe on Android we should not allocate a PATH_MAX chunk
  */
 static struct fsroot_file *fsroot_create_file(const char *path, uid_t uid, gid_t gid, mode_t mode)
 {
 	struct fsroot_file *file = mm_new0(struct fsroot_file);
+	char *fullpath = mm_new0n(PATH_MAX);
 
-	file->path = path;
+	if (!fsroot_fullpath(path, fullpath, PATH_MAX)) {
+		mm_free(file);
+		goto end;
+	}
+
+	file->path = fullpath;
 	file->uid = uid;
 	file->gid = gid;
 	file->mode = mode;
 
+end:
 	return file;
 }
 
@@ -351,6 +359,11 @@ int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags
 		goto end;
 
 	file = fsroot_create_file(path, uid, gid, mode);
+	if (!file) {
+		error = EINVAL;
+		retval = FSROOT_E_SYSCALL;
+		goto end;
+	}
 	/*
 	 * These flags will be handled internally:
 	 * 	- O_EXCL
@@ -399,8 +412,9 @@ int fsroot_create(const char *path, uid_t uid, gid_t gid, mode_t mode, int flags
 #endif
 
 	/* Now issue the system call */
-	fd = open(path, O_CREAT | O_EXCL | flags, 0100600);
+	fd = open(file->path, O_CREAT | O_EXCL | flags, 0100600);
 	if (fd == -1) {
+		error = errno;
 		retval = FSROOT_E_SYSCALL;
 		goto end;
 	}
