@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
 #include <linux/limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -748,6 +749,29 @@ int fsroot_getattr(const char *path, struct stat *out_st)
 	return FSROOT_OK;
 }
 
+/**
+ * \param[in] linkpath Relative path to the link
+ * \param[in] target Relative path to the link target (file the link will point to)
+ * \param[in] uid UID for the symbolic link
+ * \param[in] gid GID for the symbolic link
+ * \param[in] mode Mode for the symbolic link
+ * \return `FSROOT_OK` on success or a negative value on error
+ *
+ * Creates a symbolic link.
+ *
+ * Parameter \p mode is basically there to specify the permission bits of the symlink.
+ * This function will check whether \p mode effectively describes a symlink (with `S_ISLNK(mode)`)
+ * and will fail returning `FSROOT_E_BADARGS` otherwise.
+ *
+ * If successful, a symlink will be created pointing to the file \p target (regardless of whether
+ * it exists or not) with the specified UID, GID and permissions.
+ *
+ * This function relies on the `symlink(2)` libc function to create the symlink. If the call to `symlink(2)`
+ * fails, `FSROOT_E_SYSCALL` is returned.
+ *
+ * If \p linkpath already exists, regardless of whether it is a symbolic link or not,
+ * this function goes no further and returns `FSROOT_E_EXISTS`.
+ */
 int fsroot_symlink(const char *linkpath, const char *target, uid_t uid, gid_t gid, mode_t mode)
 {
 	char full_linkpath[PATH_MAX];
@@ -763,6 +787,8 @@ int fsroot_symlink(const char *linkpath, const char *target, uid_t uid, gid_t gi
 	if (hash_table_contains(files, linkpath))
 		return FSROOT_E_EXISTS;
 
+	if (strlen(target) >= LONG_MAX)
+		return FSROOT_E_NOMEM;
 	if (symlink(target, full_linkpath) == -1)
 		retval = FSROOT_E_SYSCALL;
 
@@ -775,12 +801,31 @@ int fsroot_symlink(const char *linkpath, const char *target, uid_t uid, gid_t gi
 	return retval;
 }
 
-int fsroot_readlink(const char *linkpath, char *dst, size_t dstlen)
+/**
+ * \param[in] linkpath Relative path to a symbolic link
+ * \param[in] dst Caller-supplied pointer to a buffer
+ * \param[in] dstlen Pointer to an integer with the size of the buffer pointed to by \p dst
+ * \return `FSROOT_OK` on success or a negative value on error
+ *
+ * Reads the target of a symbolic link (the path of the file it points to) and stores it
+ * in \p buf. Unlike `lstat(2)`, fsroot_readlink() does append a NULL terminator at the end.
+ *
+ * If \p buf does not have enough space to store the target of the symbolic link
+ * and a NULL terminator (as specified by \p *dstlen) this function stores in
+ * the integer pointed to by \p dstlen the minimum length required to store the target path
+ * and a NULL terminator, and then returns `FSROOT_E_NOMEM`.
+ *
+ * If \p linkpath does not exist or it is not a symbolic link, the function
+ * returns `FSROOT_E_NOTEXISTS` without touching \p dst or \p dstlen.
+ */
+int fsroot_readlink(const char *linkpath, char *dst, size_t *dstlen)
 {
 	char full_linkpath[PATH_MAX];
+	struct stat st;
+	size_t required_size, actual_len;
 	struct fsroot_file *file;
 
-	if (!linkpath || !dst || dstlen == 0 ||
+	if (!linkpath || !dst || !dstlen ||
 			!fsroot_fullpath(linkpath, full_linkpath, sizeof(full_linkpath)))
 		return FSROOT_E_BADARGS;
 
@@ -788,9 +833,22 @@ int fsroot_readlink(const char *linkpath, char *dst, size_t dstlen)
 	if (file == NULL || !S_ISLNK(file->mode))
 		return FSROOT_E_NOTEXISTS;
 
-	if (readlink(full_linkpath, dst, dstlen) == -1)
+	if (lstat(full_linkpath, &st) == -1)
+		return FSROOT_E_SYSCALL;
+	if (st.st_size >= LONG_MAX)
+		return FSROOT_E_NOMEM;
+
+	required_size = st.st_size + 1;
+	if (*dstlen < required_size) {
+		*dstlen = required_size;
+		return FSROOT_E_NOMEM;
+	}
+
+	actual_len = readlink(full_linkpath, dst, *dstlen);
+	if (actual_len == -1)
 		return FSROOT_E_SYSCALL;
 
+	dst[actual_len] = 0;
 	return FSROOT_OK;
 }
 

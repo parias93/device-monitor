@@ -32,7 +32,7 @@ int fsroot_release(const char *path);
 int fsroot_getattr(const char *path, struct stat *out_st);
 
 int fsroot_symlink(const char *linkpath, const char *target, uid_t uid, gid_t gid, mode_t mode);
-int fsroot_readlink(const char *linkpath, char *dst, size_t dstlen);
+int fsroot_readlink(const char *linkpath, char *dst, size_t *dstlen);
 
 int fsroot_mkdir(const char *path, uid_t uid, gid_t gid, mode_t mode);
 int fsroot_rmdir(const char *path);
