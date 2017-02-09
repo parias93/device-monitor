@@ -726,19 +726,43 @@ end:
 	return retval;
 }
 
+/**
+ * \param[in] path Relative path to a file
+ * \param[out] out_st Pointer to a **stat(2)** structure
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Retrieves the attributes of the file pointed by \p path, and places them
+ * in the structure pointed to by \p out_st.
+ *
+ * These attributes are returned in a **stat(2)** structure just like the Unix
+ * **stat(2)** system call does for any file outside fsroot. However, the attributes
+ * returned by this function match those of fsroot's internal representation of the file.
+ *
+ * This function fills the **stat(2)** structure provided by the caller. It is an error
+ * not to provide a pointer to a `struct stat`, and `FSROOT_E_BADARGS` is returned
+ * if that is the case.
+ *
+ * If the file or directory pointed to by \p path does not exist, this function
+ * returns `FSROOT_E_NOTEXISTS`.
+ *
+ * In any case, this function is guaranteed no to change the contents pointed to by \p out_st
+ * in any way if a value different than `FSROOT_OK` is returned.
+ */
 int fsroot_getattr(const char *path, struct stat *out_st)
 {
+	char fullpath[PATH_MAX];
 	struct stat st;
 	struct fsroot_file *file;
 
-	if (!path || !out_st)
+	if (!path || !out_st ||
+			!fsroot_fullpath(path, fullpath, sizeof(fullpath)))
 		return FSROOT_E_BADARGS;
 
 	file = hash_table_get(files, path);
 	if (!file)
 		return FSROOT_E_NOTEXISTS;
 
-	if (stat(path, &st) == -1)
+	if (stat(fullpath, &st) == -1)
 		return FSROOT_E_SYSCALL;
 
 	st.st_mode = file->mode;
@@ -852,6 +876,25 @@ int fsroot_readlink(const char *linkpath, char *dst, size_t *dstlen)
 	return FSROOT_OK;
 }
 
+/**
+ * \param[in] path Relative path, name of the directory to be created
+ * \param[in] uid UID of the owner
+ * \param[in] gid GID of the owner
+ * \param[in] mode Mode bits (`mode_t`)
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Creates a new directory. The new directory will have the specified
+ * UID, GID and mode.
+ *
+ * The \p mode should be used primarily for setting the permissions.
+ * Passing a \p mode that does not represent a directory (`S_ISDIR(mode)` is false)
+ * is an error, and will cause `FSROOT_E_BADARGS` to be returned, without going further.
+ *
+ * If the specified directory exists, `FSROOT_E_EXISTS` is returned and no action is taken.
+ * The existing directory is not modified in any way.
+ *
+ * If the underlying call to **mkdir(2)** fails, `FSROOT_E_SYSCALL` is returned.
+ */
 int fsroot_mkdir(const char *path, uid_t uid, gid_t gid, mode_t mode)
 {
 	char fullpath[PATH_MAX];
@@ -866,7 +909,7 @@ int fsroot_mkdir(const char *path, uid_t uid, gid_t gid, mode_t mode)
 		return FSROOT_E_EXISTS;
 
 	file = fsroot_create_file(path, uid, gid, mode);
-	if (mkdir(fullpath, S_IFDIR & 0700) == -1)
+	if (mkdir(fullpath, S_IFDIR | 0700) == -1)
 		goto error;
 
 	hash_table_put(files, path, file);
@@ -877,6 +920,18 @@ error:
 	return FSROOT_E_SYSCALL;
 }
 
+/**
+ * \param[in] path Relative path, name of the directory to be deleted
+ * \return `FSROOT_OK` on success, or a negative integer on error
+ *
+ * Deletes a directory. The directory must be empty.
+ *
+ * If the specified path does not refer to a directory, or does not exist,
+ * `FSROOT_E_NOTEXISTS` is returned.
+ *
+ * If the underlying call to **mkdir(2)** fails, `FSROOT_E_SYSCALL` is returned.
+ * In particular, such a call will fail if the directory is not empty.
+ */
 int fsroot_rmdir(const char *path)
 {
 	char fullpath[PATH_MAX];
@@ -901,6 +956,19 @@ int fsroot_rmdir(const char *path)
 	return retval;
 }
 
+/**
+ * \param[in] path Path for the file to be renamed
+ * \param[in] newpath Path for the new name
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Renames a file, symlink or directory. The contents of the file are not changed.
+ * In the case of a directory, all its files and sub-directories are retained.
+ *
+ * If the file pointed to by \p path does not exist, `FSROOT_E_NOTEXISTS` is returned.
+ *
+ * In contrast, if a file already exists named \p newpath, `FSROOT_E_EXISTS` is returned
+ * and no action is taken.
+ */
 int fsroot_rename(const char *path, const char *newpath)
 {
 	struct fsroot_file *file;
@@ -930,12 +998,28 @@ int fsroot_rename(const char *path, const char *newpath)
 	return FSROOT_OK;
 }
 
+/**
+ * \param[in] path Path to an existing file
+ * \param[in] mode New mode for the file
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Change the permissions of a file.
+ *
+ * Although the Unix **chmod(2)** changes the **mode** of the file,
+ * this function only changes the permission bits. Parameter \p mode
+ * must be full Unix mode, which specifies the type of file, as well as
+ * the permissions (eg. 0100700). However, this function will reject attempts to change
+ * the type of the file (eg. from regular file to directory), and will return
+ * `FSROOT_E_BADARGS` if any such attempt is made.
+ *
+ * If the file \p path does not exist, `FSROOT_E_NOTEXISTS` is returned.
+ */
 int fsroot_chmod(const char *path, mode_t mode)
 {
 	struct fsroot_file *file;
 	mode_t filetype = mode & 0170000;
 
-	if (!path)
+	if (!path || !filetype)
 		return FSROOT_E_BADARGS;
 
 	file = hash_table_get(files, path);
@@ -953,6 +1037,16 @@ int fsroot_chmod(const char *path, mode_t mode)
 	return FSROOT_OK;
 }
 
+/**
+ * \param[in] path Path to an existing file
+ * \param[in] uid New UID for the file
+ * \param[in] gid New GID for the file
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Change the owner of a file.
+ *
+ * If the file \p path does not exist, `FSROOT_E_NOTEXISTS` is returned.
+ */
 int fsroot_chown(const char *path, uid_t uid, gid_t gid)
 {
 	struct fsroot_file *file;
@@ -1064,6 +1158,15 @@ void fsroot_deinit()
 	pthread_rwlock_destroy(&open_files.rwlock);
 }
 
+/**
+ * \param[in] root Root folder where fsroot will store its files internally
+ * \return `FSROOT_OK` on success or a negative integer on error
+ *
+ * Initialize the fsroot environment.
+ *
+ * The length of the string \p root should be no greater than `PATH_MAX`, or
+ * `FSROOT_E_NOMEM` is returned.
+ */
 int fsroot_init(const char *root)
 {
 	files = NULL;
