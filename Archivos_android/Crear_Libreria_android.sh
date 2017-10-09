@@ -1,0 +1,5 @@
+
+/home/mercurio/Escritorio/Archivos_android
+$CXX -fPIC -c -o ModCifradoSO.o ModCifradoSO.cpp -I/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/include -L/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/x86/lib/ -lcrypto -std=c++11
+$CXX -shared -fPIC -o libModCifrado_Android.so ModCifradoSO.o ModCifradoSO.h sha256.h -std=c++11 -lc -I/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/include -L/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/x86/lib/ -lcrypto
+$CXX -pie -o "ModCifrado_ejecutable" ModCifrado.cpp -L. -lModCifrado_Android -I/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/include -L/home/mercurio/Documentos/android_compilar/OpenSSL-for-Android-Prebuilt-master/openssl-1.0.2/x86/lib/ -lcrypto -std=c++11
